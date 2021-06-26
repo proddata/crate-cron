@@ -1,19 +1,28 @@
+/**
+ * 
+ * @summary crate-cron - A simple CrateDB Job Scheduler
+ * @author Georg Traar <georg@crate.io>
+ * 
+ */
+
 require("dotenv").config();
-const db = require("./db");
 const fs = require("fs");
 const CronJob = require("cron").CronJob;
 
+const database = require("./database");
+const monitoring = require("./monitoring");
+
 const CRON_TABLES = fs.readFileSync(`${__dirname}/sql/setup.sql`).toString();
 
-const JOB_SYNC_CRON = "*/10 * * * * *";
+const JOB_SYNC_CRON = "*/5 * * * * *";
 const JOB_LIST = new Map();
-let JOB_SYNC_JOB;
 
 setup();
 
+
 async function setup() {
   try {
-    await db.query(CRON_TABLES);
+    await database.query(CRON_TABLES);
     JOB_SYNC_JOB = new CronJob(JOB_SYNC_CRON, jobSync, null, true);
   } catch (error) {
     console.error(error);
@@ -22,13 +31,15 @@ async function setup() {
 }
 
 async function jobSync() {
-  console.info("Sync Jobs");
+  monitoring.counters.syncTotal.inc()
   try {
     let jobs_query =
       "SELECT id, cron, cmd, active, error, _seq_no, _primary_term " +
       "FROM cron.jobs;";
-    let db_jobs = (await db.query(jobs_query)).rows;
+    let db_jobs = (await database.query(jobs_query)).rows;
     let db_jobs_ids = db_jobs.map(job => job.id);
+
+    monitoring.gauges.activeJobs.set(db_jobs.length);
 
     // check if jobs should be removed
     JOB_LIST.forEach(job => {
@@ -46,12 +57,13 @@ async function jobSync() {
       }
     });
   } catch (error) {
+    monitoring.counters.syncFailed.inc()
     console.error(error);
   }
 }
 
 function addJob(job) {
-  console.log("Add Job: ", job.id);
+  //todoconsole.log("Add Job: ", job.id);
   job.running = false;
   job.cronJob = getCronJob(job);
   JOB_LIST.set(job.id, job);
@@ -78,13 +90,15 @@ async function runJob(job) {
   if (job.running) {
     console.log("Job already running: ", job.id);
   } else {
+    monitoring.counters.jobTotal.inc();
     job.running = true;
     let started = Date.now();
     let jobs_error = null;
     console.log("Run Job: ", job.id);
     try {
-      await db.query(job.cmd);
+      await database.query(job.cmd);
     } catch (error) {
+      monitoring.counters.jobFailed.inc();
       jobs_error = error;
       console.error(error);
     } finally {
@@ -100,7 +114,7 @@ async function logJob(job, started, ended, jobs_error) {
     "INSERT INTO cron.jobs_log (id,started,ended,error) " +
     "VALUES ($1,$2,$3,$4)";
   try {
-    db.query(query, [job.id, started, ended, jobs_error]);
+    database.query(query, [job.id, started, ended, jobs_error]);
   } catch (error) {
     console.log(error);
   }
